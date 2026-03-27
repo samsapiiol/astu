@@ -1,0 +1,264 @@
+#!/bin/bash
+
+# ======================= ASCII LOGO =======================
+show_logo() {
+cat << "EOF"
+
+        ___ ___ ___ 
+       (  _  )\_   _/(  __ \
+       | (   ) |   ) (   | (    \/
+       | (_) |   | |   | (___ 
+       |  _  |   | |   (___  )
+       | (   ) |   | |         ) |
+       | )   ( |_) (_/\__) |
+       |/     \|\__/\__)
+
+                 Made by Sam Sepiol
+EOF
+}
+
+# ======================= LOGGING =======================
+LOGFILE="$HOME/.astu.log"
+
+log_action() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOGFILE"
+}
+
+# ======================= INTERFACE AUTO-DETECT =======================
+WIFI_INTERFACE=$(iw dev | awk '$1=="Interface"{print $2}' | head -n 1)
+
+# ======================= ROOT CHECK =======================
+need_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "❌ This action requires root. Use: sudo astu <command>"
+        exit 1
+    fi
+}
+
+# ======================= FUNCTIONS =======================
+
+wifi_on() { show_logo; log_action "wifi_on"; need_root; nmcli radio wifi on; }
+wifi_off() { show_logo; log_action "wifi_off"; need_root; nmcli radio wifi off; }
+wifi_status() { show_logo; log_action "wifi_status"; nmcli radio wifi; }
+connected_devices() { show_logo; log_action "connected_devices"; arp -a; }
+interfaces() { show_logo; log_action "interfaces"; ip addr; }
+
+wifi_scan() { show_logo; log_action "wifi_scan"; nmcli device wifi list; }
+
+wifi_connect() {
+    show_logo; log_action "wifi_connect $2"
+    if [[ -z "$2" || -z "$3" ]]; then
+        echo "Usage: astu connect <SSID> <PASSWORD>"
+    else
+        nmcli device wifi connect "$2" password "$3"
+    fi
+}
+
+local_ip() { show_logo; log_action "local_ip"; ip -4 addr show "$WIFI_INTERFACE" | grep inet; }
+public_ip() { show_logo; log_action "public_ip"; curl -s ifconfig.me; }
+restart_network() { show_logo; log_action "restart_network"; need_root; systemctl restart NetworkManager; }
+
+monitor_on() {
+    show_logo; log_action "monitor_on"; need_root
+    ip link set "$WIFI_INTERFACE" down
+    iw "$WIFI_INTERFACE" set monitor control
+    ip link set "$WIFI_INTERFACE" up
+}
+
+monitor_off() {
+    show_logo; log_action "monitor_off"; need_root
+    ip link set "$WIFI_INTERFACE" down
+    iw "$WIFI_INTERFACE" set type managed
+    ip link set "$WIFI_INTERFACE" up
+}
+
+capture_traffic() {
+    show_logo; log_action "capture_traffic $2"
+    need_root
+    tcpdump -i "$WIFI_INTERFACE" -w capture.pcap -G "$2" -W 1
+}
+
+ping_test() { show_logo; log_action "ping"; ping -c 4 8.8.8.8; }
+dns_lookup() { show_logo; log_action "dnslookup $2"; nslookup "$2"; }
+trace_route() { show_logo; log_action "traceroute $2"; traceroute "$2"; }
+port_scan() { show_logo; log_action "portscan $2"; nmap "$2"; }
+
+# ======================= ATTACKS =======================
+
+arp_spoof() {
+    show_logo; log_action "arpspoof $2 $3"
+    need_root
+    arpspoof -i "$WIFI_INTERFACE" -t "$2" "$3" &
+    arpspoof -i "$WIFI_INTERFACE" -t "$3" "$2" &
+}
+
+wps_crack() {
+    show_logo; log_action "wpscrack $2"
+    need_root
+    reaver -i "$WIFI_INTERFACE" -b "$2" -vv
+}
+
+sniff_traffic() {
+    show_logo; log_action "sniff_traffic"
+    need_root
+    tcpdump -i "$WIFI_INTERFACE" -nn -v
+}
+
+# ======================= OSINT & RECON =======================
+
+ip_info() { show_logo; log_action "ipinfo $2"; curl -s http://ip-api.com/json/"$2" | jq; }
+whois_lookup() { show_logo; log_action "whois $2"; whois "$2"; }
+
+deep_scan() {
+    show_logo; log_action "deep-scan $2"
+    need_root
+    nmap -sS -sV -O "$2"
+}
+
+discover_devices() {
+    show_logo; log_action "discover"
+    need_root
+    netdiscover -r 192.168.1.0/24
+}
+
+# ======================= SYSTEM ANALYSIS =======================
+
+hidden_files() { show_logo; log_action "hidden"; find /home -type f -name ".*" 2>/dev/null; }
+
+suspicious_processes() {
+    show_logo; log_action "suspicious"
+    ps aux | grep -E "nc|ncat|perl|python|php|ruby|nmap|netcat" --color=auto
+}
+
+ssh_connections() { show_logo; log_action "sshcon"; who | grep ssh; }
+
+mac_spoof() {
+    show_logo; log_action "macspoof"
+    need_root
+    ifconfig "$WIFI_INTERFACE" down
+    macchanger -r "$WIFI_INTERFACE"
+    ifconfig "$WIFI_INTERFACE" up
+}
+
+traffic_stats() { show_logo; log_action "traffic"; ifstat -t; }
+
+cron_jobs() {
+    show_logo; log_action "cron"
+    echo "[USER CRON]"
+    crontab -l
+    echo -e "\n[SYSTEM CRON]"
+    sudo cat /etc/crontab
+}
+
+vt_url_scan() {
+    show_logo; log_action "vturl"
+    read -p "Enter URL to scan: " target_url
+    read -p "Enter VirusTotal API Key: " vt_key
+    curl --request POST --url https://www.virustotal.com/api/v3/urls \
+         --header "x-apikey: $vt_key" \
+         --form "url=$target_url"
+}
+
+check_tor() {
+    show_logo; log_action "tor"
+    curl --socks5 127.0.0.1:9050 https://check.torproject.org
+}
+
+# ======================= ADVANCED SCAN MODULES =======================
+
+fast_scan() {
+    show_logo; log_action "fast-scan $2"
+    nmap -F -T5 "$2"
+}
+
+stealth_scan() {
+    show_logo; log_action "stealth-scan $2"
+    nmap -sS -T1 --scan-delay 200ms "$2"
+}
+
+vuln_scan() {
+    show_logo; log_action "vuln-scan $2"
+    nmap --script vuln "$2"
+}
+
+# ======================= HELP MENU =======================
+help_menu() {
+show_logo
+cat << "EOF"
+
+Commands:
+  on, off, status, devices, interfaces
+  scan, connect <SSID> <PW>, ip, publicip
+  restart, monitor-on, monitor-off
+  capture <sec>, ping, dnslookup <d>, traceroute <h>
+  portscan <IP>
+
+Attacks:
+  arpspoof <target> <gateway>
+  wpscrack <BSSID>
+  sniff-traffic
+
+Recon:
+  ipinfo <IP>, whois <domain>
+  deep-scan <IP>, discover
+
+System:
+  hidden      - List hidden files
+  suspicious  - Suspicious processes
+  sshcon      - Active SSH connections
+  macspoof    - Random MAC address
+  traffic     - Live traffic monitor
+  cron        - Show cron jobs
+  vturl       - VirusTotal URL scan
+  tor         - Check Tor anonymity
+
+Advanced Scans:
+  fast-scan <IP>     (fast top-port scan)
+  stealth-scan <IP>  (IDS-evading scan)
+  vuln-scan <IP>     (vulnerability scan)
+
+Usage:
+  astu <command>
+
+EOF
+}
+
+# ======================= MAIN LOGIC =======================
+case "$1" in
+  on) wifi_on ;;
+  off) wifi_off ;;
+  status) wifi_status ;;
+  devices) connected_devices ;;
+  interfaces) interfaces ;;
+  scan) wifi_scan ;;
+  connect) wifi_connect "$@" ;;
+  ip) local_ip ;;
+  publicip) public_ip ;;
+  restart) restart_network ;;
+  monitor-on) monitor_on ;;
+  monitor-off) monitor_off ;;
+  capture) capture_traffic "$@" ;;
+  ping) ping_test ;;
+  dnslookup) dns_lookup "$@" ;;
+  traceroute) trace_route "$@" ;;
+  portscan) port_scan "$@" ;;
+  arpspoof) arp_spoof "$@" ;;
+  wpscrack) wps_crack "$@" ;;
+  sniff-traffic) sniff_traffic ;;
+  ipinfo) ip_info "$@" ;;
+  whois) whois_lookup "$@" ;;
+  deep-scan) deep_scan "$@" ;;
+  discover) discover_devices ;;
+  hidden) hidden_files ;;
+  suspicious) suspicious_processes ;;
+  sshcon) ssh_connections ;;
+  macspoof) mac_spoof ;;
+  traffic) traffic_stats ;;
+  cron) cron_jobs ;;
+  vturl) vt_url_scan ;;
+  tor) check_tor ;;
+  fast-scan) fast_scan "$@" ;;
+  stealth-scan) stealth_scan "$@" ;;
+  vuln-scan) vuln_scan "$@" ;;
+  help | *) help_menu ;;
+esac
