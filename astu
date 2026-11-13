@@ -1,183 +1,414 @@
 #!/bin/bash
+# ASTU — Advanced Security Tool Utility v2.0 (fixed)
+#
+# A multi-purpose Linux command-line utility for networking,
+# reconnaissance, and security research.
+#
+# EDUCATIONAL / AUTHORIZED USE ONLY.
+# Only run this on networks and systems you own or have explicit
+# permission to test. You are responsible for using it legally.
+#
+# Changes in v2.0 (see git history / PR description):
+# - Dependency check (`astu check`) instead of silent "command not found"
+# - Wi-Fi interface is detected lazily, not at startup, so `astu help`
+#   works even without Wi-Fi / iw installed
+# - Fixed `sshcon`, `discover` (was hardcoded to 192.168.1.0/24),
+#   `macspoof` (ifconfig -> ip), `suspicious` (false positives),
+#   `hidden` (was scanning all of /home with no limit)
+# - Added missing root checks to portscan / fast-scan / stealth-scan / vuln-scan
+# - Added argument validation (capture, portscan, dnslookup, etc.)
+# - `arpspoof` now cleans up its background processes on Ctrl+C / exit
+# - `vturl` now reads the API key silently with `read -s`
+# - Unknown commands now print an error instead of silently showing help
+# - Fixed / simplified ASCII logo
 
-# ======================= ASCII LOGO =======================
-show_logo() {
-cat << "EOF"
+set -o pipefail
 
-        ___ ___ ___ 
-       (  _  )\_   _/(  __ \
-       | (   ) |   ) (   | (    \/
-       | (_) |   | |   | (___ 
-       |  _  |   | |   (___  )
-       | (   ) |   | |         ) |
-       | )   ( |_) (_/\__) |
-       |/     \|\__/\__)
-
-                 Made by Sam Sepiol
-EOF
-}
+VERSION="2.0.0"
 
 # ======================= LOGGING =======================
 LOGFILE="$HOME/.astu.log"
 
 log_action() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOGFILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOGFILE" 2>/dev/null || true
 }
 
-# ======================= INTERFACE AUTO-DETECT =======================
-WIFI_INTERFACE=$(iw dev | awk '$1=="Interface"{print $2}' | head -n 1)
+# ======================= LOGO =======================
+show_logo() {
+cat << "EOF"
 
-# ======================= ROOT CHECK =======================
+   ___   ____ _____ _   _
+  / _ \ / ___|_   _| | | |
+ | | | |\___ \ | | | | | |
+ | |_| | ___) || | | |_| |
+  \___/ |____/ |_|  \___/
+
+  Advanced Security Tool Utility
+  Made by Sam Sepiol — educational / authorized use only
+EOF
+}
+
+# ======================= HELPERS =======================
 need_root() {
     if [[ $EUID -ne 0 ]]; then
-        echo "❌ This action requires root. Use: sudo astu <command>"
+        echo "❌ This action requires root. Use: sudo astu $1" >&2
         exit 1
     fi
 }
 
-# ======================= FUNCTIONS =======================
+require_arg() {
+    # require_arg "$value" "NAME" "usage"
+    if [[ -z "${1:-}" ]]; then
+        echo "❌ Missing $2." >&2
+        echo "Usage: $3" >&2
+        exit 1
+    fi
+}
 
-wifi_on() { show_logo; log_action "wifi_on"; need_root; nmcli radio wifi on; }
-wifi_off() { show_logo; log_action "wifi_off"; need_root; nmcli radio wifi off; }
+require_iface() {
+    if [[ -z "${1:-}" ]]; then
+        echo "❌ No Wi-Fi interface found. Is Wi-Fi available on this machine?" >&2
+        exit 1
+    fi
+}
+
+get_wifi_iface() {
+    local iface=""
+    if command -v iw >/dev/null 2>&1; then
+        iface=$(iw dev 2>/dev/null | awk '$1=="Interface"{print $2}' | head -n 1)
+    fi
+    if [[ -z "$iface" ]] && command -v nmcli >/dev/null 2>&1; then
+        iface=$(nmcli -t -f DEVICE,TYPE device status 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}')
+    fi
+    echo "$iface"
+}
+
+get_subnet() {
+    local cidr=""
+    cidr=$(ip -o -f inet addr show 2>/dev/null | awk '/scope global/{print $4; exit}')
+    if [[ -n "$cidr" ]]; then
+        echo "$cidr"
+    else
+        echo "192.168.1.0/24"
+    fi
+}
+
+check_deps() {
+    show_logo
+    echo ""
+    echo "Checking dependencies..."
+    echo ""
+    local core=(nmcli iw ip curl ping)
+    local optional=(nmap tcpdump traceroute nslookup whois jq netdiscover macchanger reaver arpspoof ifstat ss)
+    local missing_core=0
+    local missing_opt=0
+
+    for cmd in "${core[@]}"; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            echo "  ✅ $cmd"
+        else
+            echo "  ❌ $cmd  (required for basic networking)"
+            missing_core=$((missing_core + 1))
+        fi
+    done
+    echo ""
+    echo "Optional tools:"
+    for cmd in "${optional[@]}"; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            echo "  ✅ $cmd"
+        else
+            echo "  ⚠️  $cmd  (some features will not work without it)"
+            missing_opt=$((missing_opt + 1))
+        fi
+    done
+    echo ""
+    if [[ $missing_core -gt 0 ]]; then
+        echo "Missing $missing_core core tool(s). Install them, e.g.:"
+        echo "  sudo apt install network-manager wireless-tools iproute2 curl iputils-ping"
+    else
+        echo "Core tools OK."
+    fi
+    if [[ $missing_opt -gt 0 ]]; then
+        echo "Missing $missing_opt optional tool(s) — see above for which features are affected."
+    fi
+}
+
+# ======================= BASIC NETWORKING =======================
+wifi_on() { show_logo; log_action "wifi_on"; need_root "on"; nmcli radio wifi on; }
+wifi_off() { show_logo; log_action "wifi_off"; need_root "off"; nmcli radio wifi off; }
 wifi_status() { show_logo; log_action "wifi_status"; nmcli radio wifi; }
-connected_devices() { show_logo; log_action "connected_devices"; arp -a; }
+connected_devices() { show_logo; log_action "connected_devices"; arp -a 2>/dev/null || ip neigh; }
 interfaces() { show_logo; log_action "interfaces"; ip addr; }
 
 wifi_scan() { show_logo; log_action "wifi_scan"; nmcli device wifi list; }
 
 wifi_connect() {
-    show_logo; log_action "wifi_connect $2"
-    if [[ -z "$2" || -z "$3" ]]; then
+    # called as: wifi_connect connect <SSID> <PASSWORD>
+    show_logo; log_action "wifi_connect ${2:-}"
+    if [[ -z "${2:-}" || -z "${3:-}" ]]; then
         echo "Usage: astu connect <SSID> <PASSWORD>"
-    else
-        nmcli device wifi connect "$2" password "$3"
+        exit 1
     fi
+    nmcli device wifi connect "$2" password "$3"
 }
 
-local_ip() { show_logo; log_action "local_ip"; ip -4 addr show "$WIFI_INTERFACE" | grep inet; }
-public_ip() { show_logo; log_action "public_ip"; curl -s ifconfig.me; }
-restart_network() { show_logo; log_action "restart_network"; need_root; systemctl restart NetworkManager; }
+local_ip() {
+    show_logo; log_action "local_ip"
+    local iface
+    iface=$(get_wifi_iface); require_iface "$iface"
+    ip -4 addr show "$iface" | grep inet
+}
 
+public_ip() { show_logo; log_action "public_ip"; curl -s ifconfig.me; echo; }
+
+restart_network() { show_logo; log_action "restart_network"; need_root "restart"; systemctl restart NetworkManager; }
+
+# ======================= MONITOR / CAPTURE =======================
 monitor_on() {
-    show_logo; log_action "monitor_on"; need_root
-    ip link set "$WIFI_INTERFACE" down
-    iw "$WIFI_INTERFACE" set monitor control
-    ip link set "$WIFI_INTERFACE" up
+    show_logo; log_action "monitor_on"; need_root "monitor-on"
+    local iface
+    iface=$(get_wifi_iface); require_iface "$iface"
+    ip link set "$iface" down
+    iw "$iface" set monitor control
+    ip link set "$iface" up
 }
 
 monitor_off() {
-    show_logo; log_action "monitor_off"; need_root
-    ip link set "$WIFI_INTERFACE" down
-    iw "$WIFI_INTERFACE" set type managed
-    ip link set "$WIFI_INTERFACE" up
+    show_logo; log_action "monitor_off"; need_root "monitor-off"
+    local iface
+    iface=$(get_wifi_iface); require_iface "$iface"
+    ip link set "$iface" down
+    iw "$iface" set type managed
+    ip link set "$iface" up
 }
 
 capture_traffic() {
-    show_logo; log_action "capture_traffic $2"
-    need_root
-    tcpdump -i "$WIFI_INTERFACE" -w capture.pcap -G "$2" -W 1
+    # called as: capture_traffic capture <seconds>
+    show_logo; log_action "capture_traffic ${2:-10}"
+    need_root "capture"
+    local iface seconds="${2:-10}"
+    iface=$(get_wifi_iface); require_iface "$iface"
+    if ! [[ "$seconds" =~ ^[0-9]+$ ]]; then
+        echo "❌ capture needs a number of seconds. Usage: astu capture <seconds>" >&2
+        exit 1
+    fi
+    tcpdump -i "$iface" -w capture.pcap -G "$seconds" -W 1
 }
 
 ping_test() { show_logo; log_action "ping"; ping -c 4 8.8.8.8; }
-dns_lookup() { show_logo; log_action "dnslookup $2"; nslookup "$2"; }
-trace_route() { show_logo; log_action "traceroute $2"; traceroute "$2"; }
-port_scan() { show_logo; log_action "portscan $2"; nmap "$2"; }
 
-# ======================= ATTACKS =======================
+dns_lookup() {
+    require_arg "${2:-}" "domain" "astu dnslookup <domain>"
+    show_logo; log_action "dnslookup $2"; nslookup "$2"
+}
+
+trace_route() {
+    require_arg "${2:-}" "host" "astu traceroute <host>"
+    show_logo; log_action "traceroute $2"; traceroute "$2"
+}
+
+port_scan() {
+    require_arg "${2:-}" "IP/host" "astu portscan <IP>"
+    show_logo; log_action "portscan $2"; need_root "portscan"
+    nmap "$2"
+}
+
+# ======================= ATTACKS (authorized use only) =======================
+# These functions are intentionally kept as in v1, but with a warning
+# and proper cleanup. Only use them on networks you own / are
+# authorized to test.
+
+ARP_PIDS=()
+
+cleanup_arp() {
+    if [[ ${#ARP_PIDS[@]} -gt 0 ]]; then
+        echo ""
+        echo "[*] Stopping arpspoof (PIDs: ${ARP_PIDS[*]})..."
+        kill "${ARP_PIDS[@]}" 2>/dev/null || true
+        wait "${ARP_PIDS[@]}" 2>/dev/null || true
+        ARP_PIDS=()
+    fi
+}
 
 arp_spoof() {
+    require_arg "${2:-}" "target IP" "astu arpspoof <target> <gateway>"
+    require_arg "${3:-}" "gateway IP" "astu arpspoof <target> <gateway>"
     show_logo; log_action "arpspoof $2 $3"
-    need_root
-    arpspoof -i "$WIFI_INTERFACE" -t "$2" "$3" &
-    arpspoof -i "$WIFI_INTERFACE" -t "$3" "$2" &
+    need_root "arpspoof"
+    local iface
+    iface=$(get_wifi_iface); require_iface "$iface"
+    echo "⚠️  ARP spoofing — only on a network you own / are authorized to test."
+    echo "Press Ctrl+C to stop."
+    trap cleanup_arp INT TERM EXIT
+    arpspoof -i "$iface" -t "$2" "$3" &
+    ARP_PIDS+=($!)
+    arpspoof -i "$iface" -t "$3" "$2" &
+    ARP_PIDS+=($!)
+    wait
 }
 
 wps_crack() {
+    require_arg "${2:-}" "BSSID" "astu wpscrack <BSSID>"
     show_logo; log_action "wpscrack $2"
-    need_root
-    reaver -i "$WIFI_INTERFACE" -b "$2" -vv
+    need_root "wpscrack"
+    local iface
+    iface=$(get_wifi_iface); require_iface "$iface"
+    echo "⚠️  Only on a network you own / are authorized to test."
+    reaver -i "$iface" -b "$2" -vv
 }
 
 sniff_traffic() {
     show_logo; log_action "sniff_traffic"
-    need_root
-    tcpdump -i "$WIFI_INTERFACE" -nn -v
+    need_root "sniff-traffic"
+    local iface
+    iface=$(get_wifi_iface); require_iface "$iface"
+    echo "⚠️  Only on a network you own / are authorized to test. Press Ctrl+C to stop."
+    tcpdump -i "$iface" -nn -v
 }
 
 # ======================= OSINT & RECON =======================
+ip_info() {
+    require_arg "${2:-}" "IP" "astu ipinfo <IP>"
+    show_logo; log_action "ipinfo $2"
+    if command -v jq >/dev/null 2>&1; then
+        curl -s "https://ip-api.com/json/$2" | jq
+    else
+        curl -s "https://ip-api.com/json/$2"; echo
+    fi
+}
 
-ip_info() { show_logo; log_action "ipinfo $2"; curl -s http://ip-api.com/json/"$2" | jq; }
-whois_lookup() { show_logo; log_action "whois $2"; whois "$2"; }
+whois_lookup() {
+    require_arg "${2:-}" "domain" "astu whois <domain>"
+    show_logo; log_action "whois $2"; whois "$2"
+}
 
 deep_scan() {
+    require_arg "${2:-}" "target" "astu deep-scan <target>"
     show_logo; log_action "deep-scan $2"
-    need_root
+    need_root "deep-scan"
     nmap -sS -sV -O "$2"
 }
 
 discover_devices() {
     show_logo; log_action "discover"
-    need_root
-    netdiscover -r 192.168.1.0/24
+    need_root "discover"
+    local subnet
+    subnet=$(get_subnet)
+    echo "[*] Scanning $subnet (detected from your network)..."
+    netdiscover -r "$subnet"
 }
 
 # ======================= SYSTEM ANALYSIS =======================
-
-hidden_files() { show_logo; log_action "hidden"; find /home -type f -name ".*" 2>/dev/null; }
+hidden_files() {
+    show_logo; log_action "hidden"
+    # Limited to $HOME, maxdepth 3, and skip noisy cache dirs.
+    find "$HOME" -maxdepth 3 -type f -name ".*" \
+        -not -path "*/.cache/*" -not -path "*/.local/share/*" \
+        2>/dev/null | head -n 200
+}
 
 suspicious_processes() {
     show_logo; log_action "suspicious"
-    ps aux | grep -E "nc|ncat|perl|python|php|ruby|nmap|netcat" --color=auto
+    # pgrep avoids matching grep itself; filter out this script's own run.
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -a -f 'nc|ncat|netcat|nmap' 2>/dev/null | grep -v "astu suspicious" || echo "No matching processes found."
+    else
+        ps aux | grep -E 'nc|ncat|netcat|nmap' | grep -v grep | grep -v "astu suspicious" || echo "No matching processes found."
+    fi
+    echo ""
+    echo "Note: python/perl/php alone are not suspicious — check the full command line above."
 }
 
-ssh_connections() { show_logo; log_action "sshcon"; who | grep ssh; }
+ssh_connections() {
+    show_logo; log_action "sshcon"
+    if command -v ss >/dev/null 2>&1; then
+        echo "[SSH connections — ss]"
+        ss -tnp state established '( dport = :22 or sport = :22 )' 2>/dev/null || ss -tn | grep ':22' || echo "No active SSH connections."
+    else
+        echo "[SSH connections — ps fallback]"
+        ps aux | grep '[s]shd' || echo "No active SSH connections."
+    fi
+    echo ""
+    echo "[Logged-in users]"
+    who
+}
 
 mac_spoof() {
     show_logo; log_action "macspoof"
-    need_root
-    ifconfig "$WIFI_INTERFACE" down
-    macchanger -r "$WIFI_INTERFACE"
-    ifconfig "$WIFI_INTERFACE" up
+    need_root "macspoof"
+    local iface
+    iface=$(get_wifi_iface); require_iface "$iface"
+    if ! command -v macchanger >/dev/null 2>&1; then
+        echo "❌ macchanger is not installed. Install it with: sudo apt install macchanger" >&2
+        exit 1
+    fi
+    ip link set "$iface" down
+    macchanger -r "$iface"
+    ip link set "$iface" up
 }
 
-traffic_stats() { show_logo; log_action "traffic"; ifstat -t; }
+traffic_stats() {
+    show_logo; log_action "traffic"
+    if command -v ifstat >/dev/null 2>&1; then
+        ifstat -t
+    else
+        echo "ifstat is not installed. Showing live interface stats instead:"
+        ip -s link
+    fi
+}
 
 cron_jobs() {
     show_logo; log_action "cron"
     echo "[USER CRON]"
-    crontab -l
-    echo -e "\n[SYSTEM CRON]"
-    sudo cat /etc/crontab
+    crontab -l 2>/dev/null || echo "(no user crontab)"
+    echo ""
+    echo "[SYSTEM CRON]"
+    if [[ -r /etc/crontab ]]; then
+        cat /etc/crontab
+    else
+        sudo cat /etc/crontab 2>/dev/null || echo "(cannot read /etc/crontab)"
+    fi
 }
 
 vt_url_scan() {
     show_logo; log_action "vturl"
-    read -p "Enter URL to scan: " target_url
-    read -p "Enter VirusTotal API Key: " vt_key
+    local target_url vt_key
+    read -r -p "Enter URL to scan: " target_url
+    require_arg "$target_url" "URL" "astu vturl"
+    read -r -s -p "Enter VirusTotal API Key: " vt_key
+    echo ""
+    if [[ -z "$vt_key" ]]; then
+        echo "❌ No API key entered." >&2
+        exit 1
+    fi
     curl --request POST --url https://www.virustotal.com/api/v3/urls \
          --header "x-apikey: $vt_key" \
          --form "url=$target_url"
+    echo ""
 }
 
 check_tor() {
     show_logo; log_action "tor"
-    curl --socks5 127.0.0.1:9050 https://check.torproject.org
+    curl --socks5 127.0.0.1:9050 https://check.torproject.org 2>/dev/null \
+        || echo "Could not reach Tor check (is Tor running on 127.0.0.1:9050?)."
 }
 
 # ======================= ADVANCED SCAN MODULES =======================
-
 fast_scan() {
-    show_logo; log_action "fast-scan $2"
+    require_arg "${2:-}" "target" "astu fast-scan <IP>"
+    show_logo; log_action "fast-scan $2"; need_root "fast-scan"
     nmap -F -T5 "$2"
 }
 
 stealth_scan() {
-    show_logo; log_action "stealth-scan $2"
+    require_arg "${2:-}" "target" "astu stealth-scan <IP>"
+    show_logo; log_action "stealth-scan $2"; need_root "stealth-scan"
     nmap -sS -T1 --scan-delay 200ms "$2"
 }
 
 vuln_scan() {
-    show_logo; log_action "vuln-scan $2"
+    require_arg "${2:-}" "target" "astu vuln-scan <IP>"
+    show_logo; log_action "vuln-scan $2"; need_root "vuln-scan"
     nmap --script vuln "$2"
 }
 
@@ -193,7 +424,7 @@ Commands:
   capture <sec>, ping, dnslookup <d>, traceroute <h>
   portscan <IP>
 
-Attacks:
+Attacks — authorized use only:
   arpspoof <target> <gateway>
   wpscrack <BSSID>
   sniff-traffic
@@ -203,7 +434,7 @@ Recon:
   deep-scan <IP>, discover
 
 System:
-  hidden      - List hidden files
+  hidden      - List hidden files (in $HOME, limited)
   suspicious  - Suspicious processes
   sshcon      - Active SSH connections
   macspoof    - Random MAC address
@@ -216,6 +447,11 @@ Advanced Scans:
   fast-scan <IP>     (fast top-port scan)
   stealth-scan <IP>  (IDS-evading scan)
   vuln-scan <IP>     (vulnerability scan)
+
+Other:
+  check         - Check installed dependencies
+  version       - Show version
+  help          - Show this menu
 
 Usage:
   astu <command>
@@ -260,5 +496,9 @@ case "$1" in
   fast-scan) fast_scan "$@" ;;
   stealth-scan) stealth_scan "$@" ;;
   vuln-scan) vuln_scan "$@" ;;
-  help | *) help_menu ;;
+  check) check_deps ;;
+  version) echo "ASTU v$VERSION" ;;
+  help) help_menu ;;
+  "" ) help_menu ;;
+  *) echo "❌ Unknown command: $1" >&2; echo "Run 'astu help' to see available commands." >&2; exit 1 ;;
 esac
